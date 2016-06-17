@@ -4,8 +4,10 @@ import pylab as plt
 from profilehooks import profile
 import matplotlib.gridspec as gridspec
 from collections import OrderedDict
+import gc
 
-from utils import dict_append, dict_concat, as_arrays, trunc_arrays, Timer
+from utils import dict_append, dict_concat, as_arrays, trunc_arrays, Timer,\
+    free_arrays
 
 class Strategy(object):
     def __init__(self, name, history, tick_size, hours_per_day, show_freq=None, save_freq=10):
@@ -36,7 +38,6 @@ class Strategy(object):
         plt.draw()
 #        sleep(0.3)
          
-#    @profile
     def step(self):
         rval = OrderedDict()
         rvec = OrderedDict()
@@ -44,11 +45,12 @@ class Strategy(object):
             
         for ind in self.indicators:
             ind.step()
+        rval['price'] = self.history['last_price'][self.now - 1]
         if (self.now - 1) % self.save_freq == 0:
             rval['step'] = self.now - 1 
-            rval['price'] = self.history['last_price'][self.now - 1]
             rval['pos'] = self.history['pos'][self.now - 1]
             rval['time_in_ticks'] = self.history['time_in_ticks'][self.now - 1]
+            rval['morning_open'] = self.history['morning_open'][max(0, self.now - self.save_freq) : self.now].max()
             for ind in self.indicators:
                 rval.update(ind.output())
                 if hasattr(ind, 'output_sparse_vec'):
@@ -70,7 +72,11 @@ class Strategy(object):
         self.d = as_arrays(self.d)
         self.vd = trunc_arrays(self.vd)
         self.d.update(self.vd)
-        print 'd.keys() =', self.d.keys()
+#        print 'd.keys() =', self.d.keys()
         with Timer() as t:
             np.savez_compressed(self.name + '.npz', **self.d)
-        print 'Savez took %f sec.' % t.interval
+#        print 'Savez took %f sec.' % t.interval
+        
+        free_arrays(self.d)
+        free_arrays(self.vd)
+        gc.collect()

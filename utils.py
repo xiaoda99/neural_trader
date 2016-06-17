@@ -7,14 +7,21 @@ def as_arrays(X):
         X[k] = np.array(X[k], dtype='float32')
     return X
 
-def trunc_arrays(X):
-    for k in X:
-        if not k.endswith('.len'):
+def trunc_arrays(X, keys=None):
+    if keys is None:
+        keys = X.keys()
+    for k in keys:
+        if k+'.len' in X:
             X[k] = X[k][:X[k+'.len']]
-    for k in X:
-        if k.endswith('.len'):
-            print k, X[k]
+            assert k+'.starts' in X and k+'.stops' in X
+            X[k+'.starts'] = np.array(X[k+'.starts'], dtype='int32')
+            X[k+'.stops'] = np.array(X[k+'.stops'], dtype='int32')
+            print k+'.len', '=', X[k+'.len']
     return X
+
+def free_arrays(X):
+    for k in X:
+        del X[k]
 
 #@profile
 def dict_append(X, x):
@@ -28,7 +35,60 @@ def dict_append(X, x):
         else:
             X[k].append(x[k])
 
+g_buffers = dict()
+
+def downcast_dtype(key, dtype):
+    if dtype == np.float64:
+        print 'Downcasting', key, 'float64 -> float32'
+        dtype = np.float32
+    elif dtype == np.int64:
+        print 'Downcasting', key, 'int64 -> int32'
+        dtype = np.int32
+    return dtype
+
 def dict_concat(X, x):
+    max_len = 120000000
+    for k in x:
+        if k not in X:
+            shape = list(x[k].shape)
+            shape[0] = max_len
+            if k not in g_buffers:
+                dtype = downcast_dtype(k, x[k].dtype)
+                print 'Allocating', shape, dtype, 'for', k
+                g_buffers[k] = np.zeros((shape), dtype=x[k].dtype)
+            X[k] = g_buffers[k]
+            X[k+'.len'] = 0
+            X[k+'.starts'] = []
+            X[k+'.stops'] = []
+        start = X[k+'.len']
+        stop = X[k+'.len'] + len(x[k])
+        assert stop <= max_len
+        X[k][start : stop] = x[k]
+        X[k+'.len'] = stop
+        X[k+'.starts'].append(start)
+        X[k+'.stops'].append(stop)
+        
+def dict_concat_old(X, x):
+    max_len = 150000000
+    for k in x:
+        if k+'.len' not in X:
+            X[k+'.len'] = 0
+            X[k+'.starts'] = []
+            X[k+'.stops'] = []
+        if k not in X and len(x[k]) > 0:
+            shape = list(x[k].shape)
+            shape[0] = max_len
+            X[k] = np.zeros((shape), dtype=x[k].dtype)
+        start = X[k+'.len']
+        stop = X[k+'.len'] + len(x[k])
+        assert stop <= max_len
+        if k in X and len(x[k]) > 0:
+            X[k][start : stop] = x[k]
+        X[k+'.len'] = stop
+        X[k+'.starts'].append(start)
+        X[k+'.stops'].append(stop)
+        
+def dict_concat_old(X, x):
     for k in x:
         if x[k].size == 0:
             continue
@@ -72,7 +132,7 @@ def load_dict(filename):
 class Timer:    
     def __enter__(self):
         self.start = time.time()
-        print 'Begin...',
+#        print 'Begin...',
         return self
 
     def __exit__(self, *args):

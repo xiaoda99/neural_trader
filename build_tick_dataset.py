@@ -20,8 +20,10 @@ except:
 base_dir = '/home/xd/data/trading'
 
 def get_day_dir(exchange, year, month, day):
-    assert year == 2015
-    if year == 2015: 
+    assert year >= 2015
+    if year >= 2015: 
+        if year == 2016 and month >= 4:
+            exchange = exchange + '/tick'
         return '%s/f_c%d/f_c%d%02dd/%s/%d%02d%02d' % (base_dir, year, year, month, exchange, year, month, day)
     else:
         return None
@@ -29,7 +31,7 @@ def get_day_dir(exchange, year, month, day):
 def find_main_contract_path(day_dir, commodity):
     max_size = 0
     main_contract_path = None
-    for contract_path in glob.glob('%s/%s*' % (day_dir, commodity)):
+    for contract_path in glob.glob('%s/%s[0-9]*' % (day_dir, commodity)): # append commodity with '1' to avoid commodity with the same prefix, eg. 'j' and 'jd'
         size = os.path.getsize(contract_path)
         if size > max_size:
             main_contract_path = contract_path
@@ -62,6 +64,7 @@ def load_ticks(exchange, commodity, year, months, use_cache=True):
         return ticks
         
     paths = get_paths(exchange, commodity, year, months)
+    assert len(paths) > 0
 #    print paths
     ticks = OrderedDict()
     for path in paths:
@@ -83,6 +86,7 @@ def load_ticks(exchange, commodity, year, months, use_cache=True):
                 if 500000 < now.time().microsecond < 1000000:
                     now = now.replace(microsecond=500000) 
                 tick = make_tick2(data)
+                morning_open = False
                 if prev is not None:
                     if now < prev:
                         continue
@@ -100,6 +104,9 @@ def load_ticks(exchange, commodity, year, months, use_cache=True):
                     if dt.seconds >= 60 * 14:
                         n_missed = ((dt.seconds % (60 * 15))* 1000000 + dt.microseconds) / 500000
                         n_missed = 0
+                        if dt.seconds >= 60 * 60 * 5:
+                            print '***********************************morning open!***************************'
+                            morning_open = True 
                     else:
                         n_missed = (dt.seconds * 1000000 + dt.microseconds) / 500000 - 1
                     if n_missed > 100:
@@ -126,6 +133,7 @@ def load_ticks(exchange, commodity, year, months, use_cache=True):
                 tick['time_in_ticks'] = n_ticks
                 if tick['time_in_ticks'] == 0 and ticks.has_key('last_price') and abs(tick['last_price'] - ticks['last_price'][-1]) > 400:
                     print '*******************************************big jump!', path
+                tick['morning_open'] = int(morning_open)
                 dict_append(ticks, tick)
 #                dict_append(ticks_today, tick)
                 n_ticks += 1
@@ -188,32 +196,39 @@ def dict_stack(X, Y):
     for key in Y:
         X[key] = np.append(X[key], Y[key])
 
+
+#('zc', 'TA', 2, 6.25),
+#('zc', 'RM', 1, 6.25), # caipo, 2000
+#('dc', 'y', 2, 6.25), # douyou, 5000
+#('dc', 'cs', 1, 3.75), # dianfen, 2000
+#('sc', 'cu', 10, 7.75), # Cu, 30000
+#('sc', 'al', 5, 7.75), # Al, 12000
+
 futures = [
-##('dc', 'pp', 1, 3.75),
+('dc', 'pp', 1, 3.75),#
 ('dc', 'l', 5, 3.75),
 ('zc', 'MA', 1, 6.25),
-('zc', 'TA', 2, 6.25),
+('sc', 'bu', 2, 7.75/5.75),  # liqing, 2000 #
 
 ('zc', 'SR', 1, 6.25), # tang, 5000
-('dc', 'm', 1, 6.25), # doupo, 2000
-('zc', 'RM', 1, 6.25), # caipo, 2000
-('dc', 'y', 2, 6.25), # douyou, 5000
+('dc', 'm', 1, 6.25), # doupo, 2000 #
 ('dc', 'p', 2, 6.25), # zonglv, 5000
 ('dc', 'c', 1, 3.75), # yumi, 2000
-('dc', 'cs', 1, 3.75), # dianfen, 2000
 ('zc', 'CF', 5, 6.25 ),  # cotton, 12000
 
 ('sc', 'ag', 1, 9.25), # Ag, 3000
-('sc', 'cu', 10, 7.75), # Cu, 30000
 ('sc', 'zn', 5, 7.75), # Zn, 15000
-('sc', 'al', 5, 7.75), # Al, 12000
 ('sc', 'ni', 10, 7.75), # Ni, 60000
+
+('sc', 'rb', 1, 7.75/5.75), # luowen, 2000 #
+('dc', 'i', 0.5, 6.25), # tiekuang, 300 
+('dc', 'j', 0.5, 6.25), # #jiaotan, 800 
 ]
 
 if __name__ == "__main__":
     for exchange, commodity, _, _ in futures:
-        year = 2015  
-        for month in range(1, 13):  
+        year = 2016
+        for month in range(1, 6):  
             print 'month =', month
             ticks = load_ticks(exchange, commodity, year, [month], use_cache=False)
             fname = '%s/ticks_%s%d%02d.pkl' % (base_dir, commodity, year % 1000, month)

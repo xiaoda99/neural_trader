@@ -8,6 +8,7 @@ from scipy import ndimage
 import pylab as plt
 from profilehooks import profile
 import matplotlib.gridspec as gridspec
+import gc
 
 from pylab import rcParams
 rcParams['figure.figsize'] = 20, 10
@@ -132,7 +133,8 @@ def round_to_odd(val):
 def n2str(n):
 #    assert n % 120 == 0, str(n)
     m = n / 120
-    if m < 60:
+#    if m < 60:
+    if True:
         return str(m) + 'm'
     assert m % 60 == 0, str(m)
     h = m / 60
@@ -142,7 +144,7 @@ class ProfileBase(object):
     def __init__(self, s, n, m,
                  name=None,
                  std_saliency_thld=1.5,
-                 output_thlds=[1.5, 2., 2.5, 3],
+                 output_thlds=[1.5, 2.5, 3],
                  price_range=None,
                  tick_size=1,
                  normalize_offset=True,
@@ -187,9 +189,15 @@ class ProfileBase(object):
         self.v = np.zeros(self.buffer_len)
         
         self.saliency_vec = np.zeros(self.price_range[1], dtype='float32')
-        self.visit_time_profile = np.zeros(self.price_range[1], dtype='int32')
-#        self.visit_time_profile[:] = -np.inf
+        self.access_time_profile = np.zeros(self.price_range[1], dtype='int32')
         self.init_profiles()
+        
+        self.sparse_lrn_configs = [
+                             {'square' : False, 'w' : 0.5},
+                             {'square' : False, 'w' : 1.},
+                             {'square' : True, 'w' : 0.5},
+                             {'square' : True, 'w' : 1.},
+                             ]
         
     def init_profiles(self):
         raise NotImplementedError()
@@ -246,15 +254,26 @@ class ProfileBase(object):
     def accum_saliency(self):
         raise NotImplementedError()
         
-#    @profile
+    def update_access_time_profile(self):
+        price = self.price[0][self.s.now - 1]
+        prev_price = self.price[0][self.s.now - 2] if self.s.now - 2 >= 0 else price
+        # deal with price gap between ticks
+        if price > prev_price:
+            self.access_time_profile[prev_price + 1 : price + 1] = self.s.now - 1
+        if price < prev_price:
+            self.access_time_profile[price : prev_price] = self.s.now - 1
+        else:
+            self.access_time_profile[price] = self.s.now - 1
+            
     def step(self):
         self.price = [self.s.history['last_price'], self.s.now - 1, 0, 0]
         if self.precomputed:
             self._precomputed_step()
         else:
             self._step()
+            
+        self.update_access_time_profile()
         
-        self.visit_time_profile[get(self.price)] = self.s.now - 1
         bias = get(self.bias)
         if bias is None:
             return
@@ -281,12 +300,24 @@ class ProfileBase(object):
         profile[profile_range[0] : profile_range[1]] = p / denorm
         return profile
         
+    def sparse_lrn(self, strengths, square=False, w=0.5):
+        w = int(round(strengths.shape[0] * w))
+        if w < 1:
+            print 'length-1 profile!'
+            w = 1
+        v = np.ones(w) / w
+        s = strengths**2 if square else strengths
+        denorm = np.convolve(s, v, mode='same')
+        if square:
+            denorm = np.sqrt(denorm)
+        return strengths / denorm 
+        
     def smooth_profile(self, profile, profile_range, normalize=True):
         smoothing_win = self.volatility * 0.5  # choose 0.5 for no good reason
         smoothed = ndimage.filters.gaussian_filter1d(profile, smoothing_win / 2., mode='constant')
 #        smoothed = profile
-#        smoothed[:profile_range[0]] = 0.
-#        smoothed[profile_range[1]:] = 0.
+        smoothed[:profile_range[0]] = 0.
+        smoothed[profile_range[1]:] = 0.
         
         if normalize:
 #            smoothed = self.normaliza_profile(profile, profile_range)
@@ -299,12 +330,17 @@ class ProfileBase(object):
                 smoothed *= 0. 
         return smoothed
     
-    def sparsify_profile(self, profile):
-        thld = min(self.output_thlds)
-#        profile = self.smoothed_pivot_profile
-        levels = np.where(profile >= thld)[0]
-        strengths = profile[levels]
-        return levels, strengths
+    @staticmethod
+    def sparsify_profile(pivot_profile, access_time_profile, thld, normalize=False):
+        levels = np.where(pivot_profile >= thld)[0]
+        strengths = pivot_profile[levels]
+        atimes = access_time_profile[levels]
+#        if normalize and strengths.shape[0] > 0:
+#            strengths_list = []
+#            for kwargs in self.sparse_lrn_configs:
+#                strengths_list.append(self.sparse_lrn(strengths, **kwargs))
+#            strengths = np.array(strengths_list).T
+        return levels, strengths, atimes
     
     def output_vec(self):
         rval = OrderedDict()
@@ -317,101 +353,11 @@ class ProfileBase(object):
     def output_sparse_vec(self):
         raise NotImplementedError()
     
-    def get_nearby_levels(self, price, profile, profile_range, thld):
-        lowest = profile_range[0]
-        highest = profile_range[1] - 1
-        # resistance
-        i = price
-        while i < highest and (profile[i] < thld or profile[i] < profile[i - 1] or profile[i] < profile[i + 1]):
-            i += 1
-        R = i #if i < highest else price
-        
-        # support
-        i = price
-        while i > lowest and (profile[i] < thld or profile[i] < profile[i - 1] or profile[i] < profile[i + 1]):
-            i -= 1
-        S = i #if i > lowest else price
-        return S, R
-    
-    def get_nearby_levels_sparse(self, price, profile, profile_range, thld):
-        lowest = profile_range[0]
-        highest = profile_range[1] - 1
-        levels, strengths = profile
-        levels = levels[strengths >= thld]
-        strengths = strengths[strengths >= thld]
-        levels = np.concatenate((levels, np.array([lowest, highest])))
-        strengths = np.concatenate((strengths, np.array([profile[lowest], profile[highest]])))
-        
-        nearest = levels[np.abs(levels - price).argmin()]
-        if nearest > price:
-            left_levels = levels[levels < price]
-        elif nearest < price:  
-            left_levels = levels[levels > price]
-        else:
-            left_levels = levels[levels != price]
-        second_nearest = left_levels[np.abs(left_levels - price).argmin()]
-        S = min(nearest, second_nearest)
-        R = max(nearest, second_nearest)
-        return S, R    
-       
-    def get_nearby_support(self, price, profile, profile_range, thld):
-        levels, strengths = profile
-        levels, strengths = levels[(levels <= price) & (strengths >= thld)], \
-                        strengths[(levels <= price) & (strengths >= thld)]
-#        if hasattr(self, 'filter_levels') and len(levels) > 0:
-#            levels, strengths = self.filter_levels(levels, strengths)
-#        lowest = min(profile_range[0], max(0, price - self.volatility * 10))
-        lowest = profile_range[0]
-        precond = False
-        if lowest not in levels:
-            levels = np.append(levels, lowest)
-            strengths = np.append(strengths, self.dense_profiles[0][lowest])
-#            if self.dense_profiles[0][lowest] >= thld:
-#                print '111', self.dense_profiles[0][lowest], '>=', thld
-#                precond = True
-        
-        i = np.abs(levels - price).argmin()
-        support = levels[i]
-        strength = strengths[i]
-#        if support == lowest:
-#            print '222', strength
-        return support, strength
-       
-    def get_nearby_resistance(self, price, profile, profile_range, thld):
-        levels, strengths = profile
-        levels, strengths = levels[(levels >= price) & (strengths >= thld)], \
-                        strengths[(levels >= price) & (strengths >= thld)]
-#        if hasattr(self, 'filter_levels') and len(levels) > 0:
-#            levels, strengths = self.filter_levels(levels, strengths)
-#        highest = max(profile_range[1], min(profile.shape[0], price + self.volatility * 10))
-        highest = profile_range[1] - 1
-        if highest not in levels:
-            levels = np.append(levels, highest)
-            strengths = np.append(strengths, self.dense_profiles[1][highest])
-        
-        i = np.abs(levels - price).argmin()
-        resistance = levels[i]
-        strength = strengths[i]
-        return resistance, strength
-    
     def output_default(self, price, profile_range, rval):
-        # Make this indicator as "ineffective" as possible to avoid disturbing other good indicators. 
-        # This turns out to be not easy! 
         rval[self.name + '.volatility'] = 0.
-        return rval
-        lowest = profile_range[0]
-        highest = profile_range[1] - 1
-        for thld in self.output_thlds:
-            name = self.name + '_th' + str(thld)
-            rval[name + '.R'] = highest
-            rval[name + '.R_offset'] = 10.
-            rval[name + '.R_strength'] = 0.
-            rval[name + '.R_elapsed'] = 1.
-            rval[name + '.S'] = lowest
-            rval[name + '.S_offset'] = 10.
-            rval[name + '.S_strength'] = 0.
-            rval[name + '.S_elapsed'] = 1.
-            rval[name + '.R/S_ratio'] = 0.
+        rval[self.name + '.level_start'] = profile_range[0]
+        rval[self.name + '.level_stop'] = profile_range[1]
+        rval[self.name + '.price_strength'] = 0.
         return rval
         
     def _output(self, price, profiles, profile_range, thld, rval):
@@ -423,15 +369,15 @@ class ProfileBase(object):
         R, R_strength = self.get_nearby_resistance(price, r_profile, profile_range, thld)
         R_offset = R - price
 #        R_strength = r_profile[R] 
-        R_elapsed = max(1., (self.s.now - 1 - self.visit_time_profile[R]) * 1. / self.m)
+        R_elapsed = max(1., (self.s.now - 1 - self.access_time_profile[R]) * 1. / self.m)
         S_offset = price - S
 #        S_strength = s_profile[S]
-        S_elapsed = max(1., (self.s.now - 1 - self.visit_time_profile[S]) * 1. / self.m)
+        S_elapsed = max(1., (self.s.now - 1 - self.access_time_profile[S]) * 1. / self.m)
         if self.normalize_offset:
             R_offset = R_offset * 1. / self.volatility
             S_offset = S_offset * 1. / self.volatility
     #        assert 0. <= rval['R_elapsed'] <= 1., str(rval['R_elapsed'])
-    #        assert 0. <= rval['S_elapsed'] <= 1., '%f, now = %d, t = %d' % (rval['S_elapsed'], self.s.now, self.visit_time_profile[i])
+    #        assert 0. <= rval['S_elapsed'] <= 1., '%f, now = %d, t = %d' % (rval['S_elapsed'], self.s.now, self.access_time_profile[i])
         
         if R_offset == 0 and S_offset != 0: # just on the highest
             RS_ratio = -10.
@@ -452,45 +398,6 @@ class ProfileBase(object):
         rval[name + '.S_elapsed'] = S_elapsed
         rval[name + '.R/S_ratio'] = RS_ratio 
         return rval
-      
-    def _output_old(self, price, profile, profile_range, thld, rval):
-        raise NotImplementedError()
-        name = self.name + '_th' + str(thld)
-        
-        if type(profile) == np.ndarray: 
-            S, R = self.get_nearby_levels(price, profile, profile_range, thld)
-        else:
-            assert type(profile) in [list, tuple] and len(profile) == 2 # sparse profile
-            S, R = self.get_nearby_levels_sparse(price, profile, profile_range, thld)
-            
-        R_offset = (R - price) * 1. / self.volatility
-        R_strength = profile[R] 
-        R_elapsed = max(1., (self.s.now - 1 - self.visit_time_profile[R]) * 1. / self.m)
-        S_offset = (price - S) * 1. / self.volatility
-        S_strength = profile[S]
-        S_elapsed = max(1., (self.s.now - 1 - self.visit_time_profile[S]) * 1. / self.m)
-    #        assert 0. <= rval['R_elapsed'] <= 1., str(rval['R_elapsed'])
-    #        assert 0. <= rval['S_elapsed'] <= 1., '%f, now = %d, t = %d' % (rval['S_elapsed'], self.s.now, self.visit_time_profile[i])
-        
-        if R_offset == 0 and S_offset != 0: # just on the highest
-            RS_ratio = -10.
-        elif R_offset != 0 and S_offset == 0: # just on the lowest
-            RS_ratio = 10.
-        elif R_offset == 0 and S_offset == 0: # just on the S/R line
-            RS_ratio = 0. 
-        else:
-            RS_ratio = np.log(R_offset * 1. / (S_offset))
-            assert abs(RS_ratio) <= 10., str(RS_ratio) + '= log(-' + str(R_offset) + '/' + str(S_offset) + ')'
-        rval[name + '.R'] = R
-        rval[name + '.R_offset'] = R_offset
-        rval[name + '.R_strength'] = R_strength 
-        rval[name + '.R_elapsed'] = R_elapsed
-        rval[name + '.S'] = S
-        rval[name + '.S_offset'] = S_offset
-        rval[name + '.S_strength'] = S_strength
-        rval[name + '.S_elapsed'] = S_elapsed
-        rval[name + '.R/S_ratio'] = RS_ratio 
-        return
     
     def get_profiles(self, profile_range):
         raise NotImplementedError()
@@ -508,7 +415,10 @@ class ProfileBase(object):
             return rval
         
         rval[self.name + '.volatility'] = self.volatility
+        rval[self.name + '.level_start'] = profile_range[0]
+        rval[self.name + '.level_stop'] = profile_range[1] 
         profiles = self.get_profiles(profile_range)
+        rval[self.name + '.price_strength'] = self.dense_profiles[0][price]
         
 #        for thld in self.output_thlds: 
 #            self._output(price, profiles, profile_range, thld, rval)
@@ -560,107 +470,24 @@ class PivotProfile(ProfileBase):
         self.pivot_profile = self.saliency_vec_EMA.step(self.saliency_vec)
         
     def get_profiles(self, profile_range):
-        profile = self.smooth_profile(self.pivot_profile, profile_range, normalize=True)
-        sparse_profile = self.sparsify_profile(profile)
-#        self.sync_nearby_visit_time(sparse_profile)
-        self.dense_profiles = [profile, profile]
-        self.profiles = [sparse_profile, sparse_profile]
-        return sparse_profile, sparse_profile
+        pivot_profile = self.smooth_profile(self.pivot_profile, profile_range, normalize=True)
+        thld = min(self.output_thlds)
+        sparse_profile = self.sparsify_profile(pivot_profile, self.access_time_profile, thld)
+        self.dense_profiles = [pivot_profile,]
+        self.profiles = [sparse_profile,]
+        return self.profiles 
     
     def output_sparse_vec(self):
         rval = OrderedDict()
 #        assert len(self.profiles) == 1
         if self.s.now < self.m:
-            rval[self.name + '.levels'] = np.array([], dtype='int32')
-            rval[self.name + '.strengths'] = np.array([], dtype='float32')
+            rval[self.name] = np.zeros((0, 4), dtype='float32')
             return rval
-        levels, strengths = self.profiles[0]
-#        rval[self.name + '.levels'] = [(self.s.now - 1, l) for l in levels]
-#        rval[self.name + '.strengths'] = list(strengths)
-        rval[self.name + '.levels'] = np.vstack((np.ones_like(levels) * (self.s.now - 1), levels)).astype('int32').T
-        rval[self.name + '.strengths'] = strengths.astype('float32')
+        levels, strengths, atimes = self.profiles[0]
+        steps = np.ones_like(levels) * (self.s.now - 1)
+        rval[self.name] = np.vstack([steps, levels, strengths, atimes]).astype('float32').T
         return rval
     
-    def sync_nearby_visit_time(self, profile):
-        levels, strengths = profile
-        if len(levels) == 0:
-            return
-#        dlevels = levels - np.roll(levels, 1)
-#        dlevels[dlevels < 0] = -1
-#        self.dlevels = np.concatenate([self.dlevels, dlevels])
-        
-        split_idx = np.where(levels - np.roll(levels, 1) != 1)[0]
-        self.split_stats.append((len(levels), len(split_idx)))
-        split_idx = np.append(split_idx, levels.shape[0])
-        for i in range(split_idx.shape[0] - 1):
-            level_cluster = levels[split_idx[i] : split_idx[i + 1]]
-            self.visit_time_profile[level_cluster] = self.visit_time_profile[level_cluster].max() 
-        
-    def get_recent_levels(self, profile, profile_range, thld):
-        levels, strengths = profile
-        levels = levels[strengths >= thld]
-        lowest = profile_range[0]
-        if lowest not in levels:
-            levels = np.append(levels, lowest)
-        highest = profile_range[1] - 1
-        if highest not in levels:
-            levels = np.append(levels, highest)
-#        if len(levels) == 0:
-#            return None, None
-        vtimes = self.visit_time_profile[levels]
-        latest = vtimes.max()
-        latest_levels = levels[vtimes == latest]
-        if len(vtimes[vtimes < latest]) == 0:
-            assert False
-#            return latest_levels, None
-        second_latest = vtimes[vtimes < latest].max()
-        second_latest_levels = levels[vtimes == second_latest]
-        return latest_levels, second_latest_levels
-    
-#    def output_default(self, price, profile_range, rval):
-#        super(PivotProfile, self).output_default(price, profile_range, rval)
-#        for thld in self.output_thlds:
-#            name = self.name + '_th' + str(thld)
-#            rval[name + '.R_latest'] = False
-#            rval[name + '.R_2ndlatest'] = False
-#            rval[name + '.S_latest'] = True  # trick to satisfy asserter0
-#            rval[name + '.S_2ndlatest'] = False
-#            rval[name + '.latestlevel'] = rval[name + '.S']
-#            rval[name + '.2ndlatestlevel'] = rval[name + '.S'] 
-#        return rval
-#        
-#    def _output(self, price, profiles, profile_range, thld, rval):
-#        super(PivotProfile, self)._output(price, profiles, profile_range, thld, rval)
-#        name = self.name + '_th' + str(thld)
-#        R = rval[name + '.R']
-#        S = rval[name + '.S']
-#        rval[name + '.R_latest'] = False
-#        rval[name + '.R_2ndlatest'] = False
-#        rval[name + '.S_latest'] = False
-#        rval[name + '.S_2ndlatest'] = False
-#        latest_levels, second_latest_levels = self.get_recent_levels(profiles[0], profile_range, thld)
-#        rval[name + '.latestlevel'] = latest_levels.mean()
-#        rval[name + '.2ndlatestlevel'] = second_latest_levels.mean()
-#        if latest_levels is None:
-#            assert False
-##            return rval
-##        self.asserters[0].soft_assert(S in latest_levels or R in latest_levels)
-#        if S in latest_levels:
-#            rval[name + '.S_latest'] = True
-#        if R in latest_levels:
-#            rval[name + '.R_latest'] = True
-#        if second_latest_levels is None:
-#            assert False
-##            return rval
-#        if S in second_latest_levels:
-#            rval[name + '.S_2ndlatest'] = True
-#        if R in second_latest_levels:
-#            rval[name + '.R_2ndlatest'] = True
-##        if S != R and S not in second_latest_levels and R not in second_latest_levels:  
-##            # the two level groups are on the same side
-##            self.asserters[1].soft_assert((latest_levels.mean() - price) * (second_latest_levels.mean() - price) >= 0)
-#        return rval
-        
 class SRProfile(ProfileBase):
     def init_profiles(self):
         self.s_saliency_vec_EMA = EMA(self.m)
@@ -775,68 +602,75 @@ def test_precompute():
     sal2 = ind2.saliency[0][ind2.saliency[3]:-ind2.saliency[3]]
     print np.abs(sal - sal2).mean(), np.abs(sal - sal2).max(), np.abs(sal).mean()
 
-#from build_tick_dataset import futures
-futures = [
-('dc', 'pp', 1, 3.75),
-#('dc', 'l', 5, 3.75),
-#('zc', 'MA', 1, 6.25),
-#('zc', 'TA', 2, 6.25),
-#
-#('zc', 'SR', 1, 6.25), # tang, 5000
-#('dc', 'm', 1, 6.25), # doupo, 2000
-###('zc', 'RM', 1, 6.25), # caipo, 2000
-###('dc', 'y', 2, 6.25), # douyou, 5000
-#('dc', 'p', 2, 6.25), # zonglv, 5000
-###('dc', 'c', 1, 3.75), # yumi, 2000
-###('dc', 'cs', 1, 3.75), # dianfen, 2000
-#('zc', 'CF', 5, 6.25 ),  # cotton, 12000
-#
-#('sc', 'ag', 1, 9.25), # Ag, 3000
-##('sc', 'cu', 10, 7.75), # Cu, 30000
-#('sc', 'zn', 5, 7.75), # Zn, 15000
-##('sc', 'al', 5, 7.75), # Al, 12000
-#('sc', 'ni', 10, 7.75), # Ni, 60000
-]
-
-base_dir = 'data/pp/'
-
-def test_output():
-    for exchange, commodity, tick_size, hours_per_day in futures:
-        ticks = load_ticks(exchange, commodity, 2015, range(1, 13))   
-        
-        s = Strategy(base_dir+commodity + '1501-1512_pivot', ticks, tick_size, hours_per_day, save_freq=10)#, show_freq=10)
-    #    ind_xs = SRProfile(s, 0.5*60*2, int(30*60*2))
-        ind_s = PivotProfile(s, 5*60*2, int(1 * hours_per_day * 60 * 60 * 2 * 1.5))
-        ind_m = PivotProfile(s, 30*60*2, int(5 * hours_per_day * 60 * 60 * 2 * 1.5))
-        for ind in [
-                    ind_m,
-                    ind_s, 
-    #                ind_xs,
-                    ]:
-            ind.precompute()
-            s.add_indicator(ind)
-        s.run()
-    return s
-
-def test_plot():
-    for _, commodity, _, _ in futures:
-        for lcn in [10, ]:
-            d = load_dict(base_dir+commodity+'1501-1512_pivot.npz')
-            piecewise_plot(d, 12, vec_inds=['piv30m', 'piv5m'], inds=['pos'], save_name=base_dir+commodity+'1501-1512_newcolor3.png')
-            del d
-
-def piecewise_plot(d, n_pieces, vec_inds=[], inds=[], conds=[], cond_colors=['cyan', 'yellow'], xtick=10*60*2, ytick=None, stride=10, save_name=None):
+def piecewise_plot(d, n_pieces, n_plotted=None, vec_inds=[], inds=[], conds=[], cond_colors=['cyan', 'yellow'], xtick=10*60*2, ytick=None, stride=10, save_name=None):
     total_len = d['step'].shape[0]
     piece_len = int(math.ceil(total_len * 1. / n_pieces))
+    if n_plotted is None:
+        n_plotted = n_pieces
     for i, start in enumerate(range(0, total_len, piece_len)):
-#        if i > 0:
-#            return
+        if i == n_plotted:
+            return
         stop = min(start + piece_len, total_len)
         save_name_i = save_name.replace('.png', '.part' + str(i) + '.png') if save_name is not None else None
-        plot(d, vec_inds=vec_inds, inds=inds, conds=conds, cond_colors=cond_colors, xtick=xtick, ytick=ytick, stride=stride, save_name=save_name_i,
+#        plot(d, vec_inds=vec_inds, inds=inds, conds=conds, cond_colors=cond_colors, xtick=xtick, ytick=ytick, stride=stride, save_name=save_name_i,
+#             start=start, stop=stop)
+        plot2(d, vec_inds=vec_inds, inds=inds, xtick=xtick, ytick=ytick, stride=stride, save_name=save_name_i,
              start=start, stop=stop)
-    
-def plot(d, vec_inds=[], inds=[], conds=[], cond_colors=['cyan', 'yellow'], xtick=10*60*2, ytick=None, stride=10, save_name=None, start=None, stop=None):
+ 
+scale_plot_configs = [
+           [((1.5, 2.), 'gold', 0.05),
+            ((2., 2.5), 'gold', 0.1), 
+           ((2.5, 3.), 'salmon', 0.2, ), 
+           ((3., 3.5), 'red', 0.3, ),
+           ((3.5, np.inf), 'brown', 0.5),
+           ],
+            
+           [((1.5, 2.), 'cyan', 0.05),
+            ((2., 2.5), 'cyan', 0.1), 
+           ((2.5, 3.), 'dodgerblue', 0.2, ), 
+           ((3., 3.5), 'blue', 0.3, ),
+           ((3.5, np.inf), 'navy', 0.5),
+           ],
+                      
+           [((1.5, 2.), 'lightgreen', 0.05),
+            ((2., 2.5), 'lightgreen', 0.1), 
+           ((2.5, 3.), 'limegreen', 0.2, ), 
+           ((3., 3.5), 'green', 0.3, ),
+           ((3.5, np.inf), 'darkgreen', 0.5),
+           ],
+        ]
+                       
+plot_configs = [
+           [((1.5, 2.), 'cyan', 0.05),
+            ((2., 2.5), 'turquoise', 0.1), 
+           ((2.5, 3.), 'lime', 0.1, ), 
+           ((3., 3.5), 'green', 0.1, ),
+           ((3.5, np.inf), 'darkgreen', 0.15),
+           ],
+            
+           [((1.5, 2.), 'yellow', 0.05),
+            ((2., 2.5), 'gold', 0.1),  
+           ((2.5, 3.), 'darkorange', 0.15, ),
+           ((3., 3.5), 'red', 0.15, ),
+           ((3.5, np.inf), 'purple', 0.2),
+           ],
+                
+#           [((1.5, 2.), 'cyan', 0.05),
+#            ((2., 2.5), 'turquoise', 0.05), 
+#           ((2.5, 3.), 'lime', 0.1, ), 
+#           ((3., 3.5), 'limegreen', 0.1, ),
+#           ((3.5, 5.), 'green', 0.15), 
+#           ((5., np.inf), 'darkolivegreen', 0.15)],
+#            
+#           [((1.5, 2.), 'white', 0.00),
+#            ((2., 2.5), 'gold', 0.05),  
+#           ((2.5, 3.), 'darkorange', 0.15, ),
+#           ((3., 3.5), 'red', 0.15, ),
+#           ((3.5, 5.), 'purple', 0.2), 
+#           ((5., np.inf), 'indigo', 0.2)],
+           ]
+  
+def plot2(d, vec_inds=[], inds=[], xtick=10*60*2, ytick=None, stride=10, save_name=None, start=None, stop=None):
     if ytick is None:
         ytick = d['piv30m.volatility'].mean()
     if start is None:
@@ -844,17 +678,100 @@ def plot(d, vec_inds=[], inds=[], conds=[], cond_colors=['cyan', 'yellow'], xtic
     if stop is None:
         stop = d['step'].shape[0]
 #    print start, stop
-    step = d['step'][start:stop]
-    price = d['price'][start:stop]
+    step = d['step']
+    price = d['price']
+    if price.shape[0] > step.shape[0]:
+        price, _, _ = get_price(price, save_freq=stride)
+        assert price.shape[0] == step.shape[0]
+    step = step[start:stop]
+    price = price[start:stop]
     
+    nplots = len(vec_inds)
+    height_ratios=[2] * nplots
+    dpi = 1000
+    width = min(30000, step.shape[0]) / dpi
+    height = sum(height_ratios) 
+    figsize=(width, height)
+    print 'figsize =', figsize
+    fig = plt.figure(figsize=figsize)
+    
+    gs = gridspec.GridSpec(nplots, 1, height_ratios=height_ratios)
+    
+    for i in range(nplots):
+        if i == 0:
+            ax0 = ax = plt.subplot(gs[i])
+        else:
+            ax = plt.subplot(gs[i], sharex=ax0)
+        
+        ax.set_xlim([step[0], step[-1]])
+        span = price.max() - price.min()
+        ax.set_ylim([price.min() - span * 0.1, price.max() + span * 0.1])
+        
+        for ind in inds:
+            plt.plot(step, d[ind][start:stop], alpha=1, linewidth=.1, zorder=3, label=ind)
+        plt.plot(step, price, color='k', linewidth=.1, zorder=3)
+        
+        ax.set_xticks(np.arange(step[0], step[-1], xtick))
+        ax.set_yticks(np.arange(price.min(), price.max(), ytick))
+        ax.xaxis.grid(b=True, color='gray', linestyle='-', linewidth=.05, alpha=.5, zorder=0)
+        ax.yaxis.grid(b=True, color='gray', linestyle='-', linewidth=.05, alpha=.5, zorder=0)
+                
+        opening = (d['time_in_ticks'] < np.roll(d['time_in_ticks'], 1))
+        opening = opening[start:stop]
+        for x in step[opening]:
+            plt.axvline(x, color='k', linewidth=.1, alpha=1, zorder=2)
+            
+        assert 'merged' in vec_inds[i], vec_inds[i]
+        ind = vec_inds[i]
+        locations = d[ind][:,:2].astype('int32')
+        strengths = d[ind][:,2]
+        scales = d[ind][:,-1].astype('int32')
+        n_scales = scales.max() + 1
+        assert n_scales == 3  # 5m+10m, 10m+30m, 30m+1h
+        for scale in range(n_scales):
+            for (low, high), color, alpha in scale_plot_configs[scale]:
+                x, y = locations[(scales == scale) & 
+                                 (locations[:,0] >= step[0]) & (locations[:,0] < step[-1]) & 
+                                 (strengths >= low) & (strengths < high)].T
+                plt.scatter(x, y, marker='_', s=0.1, linewidth=0.1, color=color, alpha=alpha)
+        
+    plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
+    if save_name is not None:
+        with Timer() as t:
+            plt.savefig(save_name, format='png', dpi=dpi, bbox_inches='tight')
+        print 'plt.savefig %s took %f sec.' % (save_name, t.interval)
+    else:
+        plt.show()
+        
+    fig.clf()
+    plt.close()
+    gc.collect()
+          
+def plot(d, vec_inds=[], inds=[], extra_inds=['pos'], conds=[], cond_colors=['cyan', 'yellow'], xtick=10*60*2, ytick=None, stride=10, save_name=None, start=None, stop=None):
+    if ytick is None:
+        ytick = d['piv30m.volatility'].mean()
+    if start is None:
+        start = 0
+    if stop is None:
+        stop = d['step'].shape[0]
+#    print start, stop
+    step = d['step']
+    price = d['price']
+    if price.shape[0] > step.shape[0]:
+        price, _, _ = get_price(price, save_freq=stride)
+        assert price.shape[0] == step.shape[0]
+    step = step[start:stop]
+    price = price[start:stop]
+    
+    assert len(extra_inds) == 1
     nplots = 1 + 1
     height_ratios=[2] + [1] * 1
     dpi = 1000
     width = min(30000, step.shape[0]) / dpi
     height = sum(height_ratios) 
     figsize=(width, height)
-    print 'figsize =', figsize
-    plt.figure(figsize=figsize)
+#    print 'figsize =', figsize
+    fig = plt.figure(figsize=figsize)
     
     gs = gridspec.GridSpec(nplots, 1, height_ratios=height_ratios)
     i = 0
@@ -864,9 +781,9 @@ def plot(d, vec_inds=[], inds=[], conds=[], cond_colors=['cyan', 'yellow'], xtic
     ax0.set_xlim([step[0], step[-1]])
     span = price.max() - price.min()
     ax0.set_ylim([price.min() - span * 0.1, price.max() + span * 0.1])
+    
     for ind in inds:
-        if ind.lower().startswith('macd') or ind.endswith('latestlevel') or ind.endswith('2ndlatestlevel') or ind.endswith('R') or ind.endswith('S') :
-            plt.plot(step, d[ind][start:stop], alpha=1, linewidth=.1, zorder=3, label=ind)
+        plt.plot(step, d[ind][start:stop], alpha=1, linewidth=.1, zorder=3, label=ind)
     plt.plot(step, price, color='k', linewidth=.1, zorder=3)
     
     ax0.set_xticks(np.arange(step[0], step[-1], xtick))
@@ -875,48 +792,35 @@ def plot(d, vec_inds=[], inds=[], conds=[], cond_colors=['cyan', 'yellow'], xtic
     ax0.yaxis.grid(b=True, color='gray', linestyle='-', linewidth=.05, alpha=.5, zorder=0)
 #    ax0.yaxis.grid(b=False)
             
-    opening = d['time_in_ticks'] < np.roll(d['time_in_ticks'], 1)
+    opening = (d['time_in_ticks'] < np.roll(d['time_in_ticks'], 1))
     opening = opening[start:stop]
     for x in step[opening]:
         plt.axvline(x, color='k', linewidth=.1, alpha=1, zorder=2)
         
-    plot_configs = [
-#                   [((1.5, 2.5), 'cyan', 0.05), 
-#                   ((2.5, 3.5), 'lime', 0.1, ),
-#                   ((3.5, 4.5), 'green', 0.15), 
-#                   ((4.5, np.inf), 'darkgreen', 0.2)],
-#                    
-#                   [((1.5, 2.5), 'yellow', 0.05), 
-#                   ((2.5, 3.5), 'orange', 0.1, ),
-#                   ((3.5, 4.5), 'red', 0.15), 
-#                   ((4.5, np.inf), 'purple', 0.2)],
-                    
-                   [((1.5, 2.), 'cyan', 0.05),
-                    ((2., 2.5), 'turquoise', 0.05), 
-                   ((2.5, 3.), 'lime', 0.1, ), 
-                   ((3., 3.5), 'limegreen', 0.1, ),
-                   ((3.5, 5.), 'green', 0.15), 
-                   ((5., np.inf), 'darkolivegreen', 0.15)],
-                    
-                   [((1.5, 2.), 'yellow', 0.05),
-                    ((2., 2.5), 'gold', 0.05),  
-                   ((2.5, 3.), 'darkorange', 0.15, ),
-                   ((3., 3.5), 'red', 0.15, ),
-                   ((3.5, 5.), 'purple', 0.2), 
-                   ((5., np.inf), 'indigo', 0.2)],
-                   ]
-    
-    with Timer() as t:
+    if len(vec_inds) == 1 and vec_inds[0].endswith('merged'):
+        print 'plot merged'
+        ind = vec_inds[0]
+        locations = d[ind][:,:2].astype('int32')
+        strengths = d[ind][:,2]
+        scales = d[ind][:,-1].astype('int32')
+        n_scales = scales.max() + 1
+        assert n_scales == 3  # 5m+10m, 10m+30m, 30m+1h
+        for scale in range(n_scales):
+            for (low, high), color, alpha in scale_plot_configs[scale]:
+                x, y = locations[(scales == scale) & 
+                                 (locations[:,0] >= step[0]) & (locations[:,0] < step[-1]) & 
+                                 (strengths >= low) & (strengths < high)].T
+                plt.scatter(x, y, marker='_', s=0.1, linewidth=0.1, color=color, alpha=alpha)
+    else:
         for j, ind in enumerate(vec_inds):
-            l = d[ind + '.levels']
-            s = d[ind + '.strengths']
+            l = d[ind][:,:2]
+            s = d[ind][:,2]
             plot_config = plot_configs[j]
 #            colors = colors[1:2]
 #            plot_config = plot_config[1:2]
             for (low, high), color, alpha in plot_config:
                 x, y = l[(l[:,0] >= step[0]) & (l[:,0] < step[-1]) & (s >= low) & (s < high)].T
                 plt.scatter(x, y, marker='_', s=0.1, linewidth=0.1, color=color, alpha=alpha)
-    print 'plt.scatter took %f sec.' % t.interval
         
     for cond, color in zip(conds, cond_colors):    
         cond = cond[start:stop]
@@ -924,12 +828,11 @@ def plot(d, vec_inds=[], inds=[], conds=[], cond_colors=['cyan', 'yellow'], xtic
     #        xsignals = np.where(cond)[0] 
             cond_steps = step[cond]
             for x in cond_steps:
-                plt.axvline(x, color=color, linewidth=.1, alpha=0.4, zorder=0)
-        print 'plt.axvline took %f sec.' % t.interval
+                plt.axvline(x, color=color, linewidth=.1, alpha=1., zorder=0)
+#        print 'plt.axvline took %f sec.' % t.interval
     plt.legend(loc='upper right', fontsize='xx-small')
         
-    inds = [ind for ind in inds if not (ind.lower().startswith('macd') or ind.endswith('R') or ind.endswith('S'))]
-    for ind in inds:
+    for ind in extra_inds:
         ax = plt.subplot(gs[i], sharex=ax0)
         i += 1
         ax.set_xlim([step[0], step[-1]])
@@ -944,38 +847,403 @@ def plot(d, vec_inds=[], inds=[], conds=[], cond_colors=['cyan', 'yellow'], xtic
     if save_name is not None:
         with Timer() as t:
             plt.savefig(save_name, format='png', dpi=dpi, bbox_inches='tight')
-        print 'plt.savefig took %f sec.' % t.interval
+        print 'plt.savefig %s took %f sec.' % (save_name, t.interval)
     else:
         plt.show()
+        
+    fig.clf()
+    plt.close()
+    gc.collect()
 
-if __name__ == '__main__':
-#    test_output()
-    test_plot()
+def load_profiles(d, name):
+    steps = d[name][:,0].astype('int32')
+    levels = d[name][:,1].astype('int32')
+    strengths = d[name][:,2] 
+    atimes = d[name][:,3].astype('int32')
+    starts = d[name + '.starts']
+    stops = d[name + '.stops']
+    profiles = [(steps[start:stop], levels[start:stop], strengths[start:stop], atimes[start:stop]) 
+                for start, stop in zip(starts, stops)]
+    return profiles
+
+strength_thld = 2.5
+def filter_profiles(profiles, strength_thld):
+    profiles = [(l[s >= strength_thld], s[s >= strength_thld], t[s >= strength_thld]) for l, s, t in profiles]
+    return profiles
+
+def densify_profile(dense_profile, levels, strengths):
+    dense_profile *= 0
+    dense_profile[levels] = strengths
+    return dense_profile
     
-#d = load_dict('pp1506-1509_pivot_stride10.npz')
-#roff = d['piv5m_th2.5.R_offset']
-#soff = d['piv5m_th2.5.S_offset']
-#roff2 = d['piv30m_th2.5.R_offset']
-#soff2 = d['piv30m_th2.5.S_offset']
-#rlat = d['piv5m_th2.5.R_latest'].astype('bool')
-#slat = d['piv5m_th2.5.S_latest'].astype('bool')
-#r2lat = d['piv5m_th2.5.R_2ndlatest'].astype('bool')
-#s2lat = d['piv5m_th2.5.S_2ndlatest'].astype('bool')
-#r = d['piv5m_th2.5.R']
-#s = d['piv5m_th2.5.S']
-#rstr = d['piv5m_th2.5.R_strength']
-#sstr = d['piv5m_th2.5.S_strength']
-#rstr1 = d['piv0.5m_th2.5.R_strength']
-#sstr1 = d['piv0.5m_th2.5.S_strength']
-#cond_bounce = (roff > 0) & (soff > 0) & (rstr >= 2.5) & (sstr >= 2.5)
-#cond_bounceup = cond_bounce & slat & r2lat & (roff / soff >= 4) & (roff2 >= 1) & (roff >= 2) & (sstr1 >= 2.5)
-#cond_bouncedown = cond_bounce & rlat & s2lat & (soff / roff >= 4) & (soff2 >= 1) & (soff >= 2) & (rstr1 >= 2.5)
-#piecewise_plot(d, 4, vec_inds=['piv5m', 'piv0.5m'], cond=cond, save_name='pp1506-1509_bounceup.png')
-#dc = load_dict('pp1506-1509_common_stride10.npz')
-#y = d['ec5m.orig']
-#y = dc['ec5m.orig']
-#y2 = dc['ec10m.orig']
-#(y[cond] > 0).mean()
-#(y2[cond] > 0).mean()
-#y[cond].mean()
-#y2[cond].mean()
+def merge_profiles(profiles, volatilities, n_profiles, thld=1.5, average_adjacent_profiles=True):
+    assert len(profiles) == n_profiles, len(profiles)
+    assert len(volatilities) == n_profiles, len(volatilities)
+    if not hasattr(merge_profiles, 'dense_profiles'):
+        merge_profiles.dense_profiles = [np.zeros(8000, dtype='float32') for _ in range(n_profiles)]
+    if not hasattr(merge_profiles, 'dense_atime_profiles'):
+        merge_profiles.dense_atime_profiles = [np.zeros(8000, dtype='int32') for _ in range(n_profiles)]
+    dense_profiles = [densify_profile(dense_profile, profile[1], profile[2]) 
+                      for dense_profile, profile in 
+                      zip(merge_profiles.dense_profiles, profiles)] 
+    dense_atime_profiles = [densify_profile(dense_profile, profile[1], profile[3]) 
+                      for dense_profile, profile in 
+                      zip(merge_profiles.dense_atime_profiles, profiles)] 
+    if average_adjacent_profiles:
+        dense_profiles = [(dense_profiles[i] + dense_profiles[i+1]) / 2. for i in range(len(dense_profiles) - 1)]
+        volatilities = [(volatilities[i] + volatilities[i+1]) / 2. for i in range(len(volatilities) - 1)]
+        
+    dense_profiles = np.vstack(dense_profiles)
+    dense_profile = dense_profiles.max(axis=0)
+    scale_profile = dense_profiles.argmax(axis=0)
+    vol_profile = np.array(volatilities)[scale_profile]    
+    dense_atime_profiles = np.vstack(dense_atime_profiles)
+    dense_atime_profile = dense_atime_profiles.max(axis=0)
+    
+    # sparsify again, adding scales and volatilities
+    levels = np.where(dense_profile >= thld)[0]
+    strengths = dense_profile[levels]
+    atimes = dense_atime_profile[levels]
+    scales = scale_profile[levels]
+    vols = vol_profile[levels]
+    
+    # FIXME: this way of dealing with steps is ugly
+    step = 0
+    for steps, _, _, _ in profiles:
+        if len(steps) > 0:
+            step = steps[0]
+            break
+    steps = np.ones(levels.shape, dtype='int32') * step
+    
+    profile = (steps, levels, strengths, atimes, vols, scales)
+    return profile
+  
+def concat_profiles(profiles):
+    l = [np.vstack((steps, levels, strengths, atimes, vols, scales)).T 
+         for steps, levels, strengths, atimes, vols, scales in profiles]
+    return np.vstack(l) 
+
+def merge2(d, n_scale, ns_in_minutes):
+#    d['piv_merged'] = d0['piv_merged']
+#    d.update(d0)
+    names = ['piv' + n2str(n*60*2*n_scale) for n in ns_in_minutes]
+    all_profiles = [load_profiles(d, name) for name in names]
+    all_volatilities = [d[name + '.volatility'] for name in names]
+    
+    for profiles, volatilities, merged_name in [(all_profiles[:4], all_volatilities[:4], 'piv_merged2'),
+                                                (all_profiles[1:], all_volatilities[1:], 'piv_merged3')]:
+        for pivs_and_vols in zip(*(profiles+volatilities)):
+            profile = merge_profiles(pivs_and_vols[:4], pivs_and_vols[4:], 4)
+            rvec = {merged_name : np.vstack(profile).T.astype('float32')}
+            dict_concat(d, rvec)
+        trunc_arrays(d, keys=[merged_name,])
+    return d
+
+def merge2_old(d0, d, n_scale, ns_in_minutes):
+    '''Consume too much memory.'''
+    d['piv_merged'] = d0['piv_merged']
+    names = ['piv' + n2str(n*60*2*n_scale) for n in ns_in_minutes]
+    all_profiles = [load_profiles(d, name) for name in names]
+    all_volatilities = [d[name + '.volatility'] for name in names]
+    
+    for profiles, volatilities, merged_name in [(all_profiles[:4], all_volatilities[:4], 'piv_merged2'),
+                                                (all_profiles[1:], all_volatilities[1:], 'piv_merged3')]:
+        merged_profiles = [merge_profiles(pivs_and_vols[:4], pivs_and_vols[4:], 4) for pivs_and_vols
+                           in zip(*(profiles+volatilities))]
+        d[merged_name] = concat_profiles(merged_profiles)
+    return d
+   
+min_strength = 1.
+max_gap = .5
+
+def get_dlevels(levels):
+    dlevels_below = levels - np.roll(levels, 1)
+    dlevels_below[0] = 1000
+    dlevels_above = np.roll(levels, -1) - levels
+    dlevels_above[-1] = 1000
+    return dlevels_below, dlevels_above
+
+def locate_nearest_pivot(profile, lowest, highest, price, volatility):
+    levels, strengths, atimes = profile
+    if len(levels) == 0:
+        lower_bound, upper_bound = lowest, highest
+        return lower_bound, upper_bound
+
+    temporal_nearest = levels[atimes == atimes.max()]
+    nearest = temporal_nearest[np.abs(temporal_nearest - price).argmin()]
+    dlevels_below, dlevels_above = get_dlevels(levels)
+    if nearest < price:
+        upper_bound = nearest
+        lower_bound = levels[(levels <= nearest) & (dlevels_below > max_gap * volatility)].max()
+    elif nearest > price:
+        lower_bound = nearest
+        upper_bound = levels[(levels >= nearest) & (dlevels_above > max_gap * volatility)].min()
+    else:  # nearest == price
+        lower_bound = levels[(levels <= nearest) & (dlevels_below > max_gap * volatility)].max()
+        upper_bound = levels[(levels >= nearest) & (dlevels_above > max_gap * volatility)].min()
+    return lower_bound, upper_bound
+
+def output_nearest_pivot(profile, lowest, highest, lower_bound, upper_bound, profile0, volatility):
+    levels, strengths, atimes = profile
+    levels0, strengths0, atimes0 = profile0
+    if lower_bound == lowest and upper_bound == highest:
+        center = (lower_bound + upper_bound) * 1. / 2
+        max_strength = 0.
+        atime = 0 
+        downward_dominance = [0., 0., 0.]
+        upward_dominance = [0., 0., 0.]
+    else:
+        inpivot_idx = (levels >= lower_bound) & (levels <= upper_bound)
+        max_strength = strengths[inpivot_idx].max()
+        center = int(levels[inpivot_idx & (strengths == max_strength)].mean().round())
+        atime = atimes.max()
+        
+        downward_dominance = []
+        upward_dominance = []
+        for distance in []:
+            upper_range = (upper_bound + 1, upper_bound + 1 + distance)
+            lower_range = (lower_bound - 1, lower_bound - 1 - distance)
+            upper_strengths = strengths0[(levels0 >= upper_range[0]) & (levels0 < upper_range[1])]
+            upper_max_strength = upper_strengths.max() if len(upper_strengths) > 0 else min_strength 
+            lower_strengths = strengths0[(levels0 >= lower_range[0]) & (levels0 < lower_range[1])]
+            lower_max_strength = lower_strengths.max() if len(lower_strengths) > 0 else min_strength
+            downward_dominance.append(max_strength / lower_max_strength)
+            upward_dominance.append(max_strength / upper_max_strength)  
+    return max_strength, center, atime, downward_dominance, upward_dominance
+
+def output_support_resistance(d, profile, lowest, highest, price, price_strength, lower_bound, upper_bound, max_strength, volatility, 
+                        max_inpivot_time=1*60*2, decay_factor=.5, accessed_max_strength=True):
+    levels, strengths, atimes = profile
+    if len(levels) == 0:
+        support, resistance = lowest, highest
+        support_strength, resistance_strength = 0., 0.
+        return support, support_strength, resistance, resistance_strength
+    if accessed_max_strength:
+        max_strength = strengths[(levels >= lower_bound) & (levels <= upper_bound) & 
+                                    (atimes.max() - atimes <= max_inpivot_time)].max()
+    effective_strength = max(strength_thld, max_strength * decay_factor)
+    effective_strength = min(3.5, effective_strength)
+    
+    dlevels_below, dlevels_above = get_dlevels(levels)
+    strengths_below = np.roll(strengths, 1)
+    strengths_below[0] = 0.
+    strengths_below = strengths_below * (dlevels_below <= max_gap * volatility)
+    strengths_above = np.roll(strengths, -1)
+    strengths_below[-1] = 0.
+    strengths_above = strengths_above * (dlevels_above <= max_gap * volatility)
+    
+    supports = levels[(strengths >= effective_strength) & (strengths_above < effective_strength)]
+    supports_strengths = strengths[(strengths >= effective_strength) & (strengths_above < effective_strength)]
+    resistances = levels[(strengths >= effective_strength) & (strengths_below < effective_strength)] 
+    resistances_strengths = strengths[(strengths >= effective_strength) & (strengths_below < effective_strength)]
+    if price_strength >= effective_strength: # in pivot, support above resistance (reversed)
+        argmin = supports[supports >= price].argmin()
+        support = supports[supports >= price][argmin]
+        support_strength = supports_strengths[supports >= price][argmin]
+        argmax = resistances[resistances <= price].argmax()
+        resistance = resistances[resistances <= price][argmax]
+        resistance_strength = resistances_strengths[resistances <= price][argmax]
+    else: # out of pivot, support below resistance (normal)
+        if len(supports[supports < price]) > 0:
+            argmax = supports[supports < price].argmax()
+            support = supports[supports < price][argmax]
+            support_strength = supports_strengths[supports < price][argmax]
+        else:
+            support = lowest
+            support_strength = 0.
+        if len(resistances[resistances > price]) > 0:
+            argmin = resistances[resistances > price].argmin()
+            resistance = resistances[resistances > price][argmin]
+            resistance_strength = resistances_strengths[resistances > price][argmin]
+        else:
+            resistance = highest
+            resistance_strength = 0.
+#    d['piv5m.support'] = support
+#    d['piv5m.support_strength'] = support_strength
+#    d['piv5m.resistance'] = resistance
+#    d['piv5m.resistance_strength'] = resistance_strength
+    return support, support_strength, resistance, resistance_strength
+        
+def output_support_resistance_old(profile, lowest, highest, price, lower_bound, upper_bound):
+    levels, strengths, atimes = profile
+#    if lowest not in levels:
+#        levels = np.concatenate([[lowest], levels])
+#    if highest not in levels:
+#        levels = np.concatenate([levels, [highest]])
+    if lower_bound <= price <= upper_bound and lower_bound != lowest and upper_bound != highest:
+        # search avoid the pivot the price is now in
+        lower_start = lower_bound - 1
+        upper_start = upper_bound + 1
+    else:
+        lower_start = price - 1
+        upper_start = price + 1
+    lower_levels = levels[levels <= lower_start]
+    support = lower_levels.max() if len(lower_levels) > 0 else lowest
+    upper_levels = levels[levels >= upper_start]
+    resistance = upper_levels.min() if len(upper_levels) > 0 else highest    
+    return support, resistance
+
+def diff_levels(profile):
+    levels, strengths, atimes = profile[:,0], profile[:,1], profile[:,2] 
+    diffs = np.diff(levels)
+    diffs = diffs[diffs > 1]
+    diff_sum = diffs.sum()
+    ndiff = len(diffs)
+    return diff_sum, ndiff
+
+def get_price(p, save_freq=10):
+#    pad = (save_freq - p.shape[0] % save_freq) % save_freq
+    pad = int(math.ceil(p.shape[0] * 1. / save_freq) * save_freq) - p.shape[0] 
+    p = np.append(p, np.ones(pad) * p[-1])
+    p = p.reshape(-1, save_freq)
+    price = p[:, 0]
+    price_low = p.min(axis=1)
+    price_high = p.max(axis=1)
+    return price, price_low, price_high
+    
+def zip2arr(l):
+    return [np.array(a) for a in zip(*l)]
+    
+def load_pivot_inds(profiles):
+    global pivot_lower_bound, pivot_upper_bound, pivot_strength, pivot_center, pivot_atime, support, resistance
+    l = [locate_nearest_pivot(profile, l, h, p, v) for profile, l, h, p, v in zip(profiles, lowest, highest, price, volatility)]
+    pivot_lower_bound, pivot_upper_bound = zip2arr(l)
+    assert 'pivot_lower_bound' in globals()
+    l = [output_nearest_pivot(profile, l, h, lb, ub, profile, v) for profile, l, h, lb, ub, v in 
+         zip(profiles, lowest, highest, pivot_lower_bound, pivot_upper_bound, volatility)]
+    pivot_strength, pivot_center, pivot_atime, _, _ = zip2arr(l)
+
+##    l = [output_support_resistance(profile, l, h, p, lb, ub) for profile, l, h, p, lb, ub in zip(profiles, lowest, highest, price, pivot_lower_bound, pivot_upper_bound)]
+
+futures = [
+#('dc', 'pp', 1, 3.75, 1),
+#('dc', 'l', 5, 3.75, 2),
+#('zc', 'MA', 1, 6.25, 2),
+#('sc', 'bu', 2, (7.75+5.75)/2, 2),  # liqing, 2000 #
+
+#('zc', 'SR', 1, 6.25, 2), # tang, 5000
+#('dc', 'm', 1, 6.25, 2), # doupo, 2000 #
+#('dc', 'p', 2, 6.25, 2), # zonglv, 5000
+#('dc', 'c', 1, 3.75, 2), # yumi, 2000
+#('zc', 'CF', 5, 6.25, 2),  # cotton, 12000
+#
+#('sc', 'ag', 1, 9.25, 3), # Ag, 3000
+#('sc', 'zn', 5, 7.75, 2), # Zn, 15000
+#
+#('sc', 'rb', 1, (7.75+5.75)/2, 2), # luowen, 2000 #
+#('dc', 'i', 0.5, 6.25, 2), # tiekuang, 300 
+#('dc', 'j', 0.5, 6.25, 2), # #jiaotan, 800
+#
+('sc', 'ni', 10, 7.75, 2), # Ni, 60000 
+]
+
+plot_futures = [
+#('dc', 'pp', 1, 3.75, 1),
+#('dc', 'l', 5, 3.75, 2),
+#('zc', 'MA', 1, 6.25, 2),
+#('sc', 'bu', 2, (7.75+5.75)/2, 2),  # liqing, 2000 #
+#
+#('zc', 'SR', 1, 6.25, 2), # tang, 5000
+#('dc', 'm', 1, 6.25, 2), # doupo, 2000 #
+#('dc', 'p', 2, 6.25, 2), # zonglv, 5000
+#('dc', 'c', 1, 3.75, 2), # yumi, 2000
+#('zc', 'CF', 5, 6.25, 2),  # cotton, 12000
+
+#('sc', 'zn', 5, 7.75, 2), # Zn, 15000
+
+#('sc', 'rb', 1, (7.75+5.75)/2, 2), # luowen, 2000 #
+#('dc', 'i', 0.5, 6.25, 2), # tiekuang, 300 
+#('dc', 'j', 0.5, 6.25, 2), # #jiaotan, 800
+
+#('sc', 'ag', 1, 9.25, 3), # Ag, 3000
+('sc', 'ni', 10, 7.75, 2), # Ni, 60000 
+]
+
+base_dir = 'data/'
+
+ns_in_minutes = [5, 10, 30, 60, 120]
+#@profile
+def test_output(year=2016, month_range=range(1, 6), exp_name=''):
+    for exchange, commodity, tick_size, hours_per_day, n_scale in futures:
+        ticks = load_ticks(exchange, commodity, year, month_range)
+        name = base_dir+commodity+str(year%100)+str(month_range[0]).zfill(2)+'-'\
+            +str(year%100)+str(month_range[-1]).zfill(2)+'_pivot'+exp_name+str(n_scale)
+        
+        s = Strategy(name, ticks, tick_size, hours_per_day, save_freq=10)#, show_freq=10)
+    #    ind_xs = SRProfile(s, 0.5*60*2, int(30*60*2))
+        ind1 = PivotProfile(s, 5*60*2*n_scale, int(1 * hours_per_day * 60 * 60 * 2 * 1.5))
+        ind2 = PivotProfile(s, 10*60*2*n_scale, int(2 * hours_per_day * 60 * 60 * 2 * 1.5))
+        ind3 = PivotProfile(s, 30*60*2*n_scale, int(5 * hours_per_day * 60 * 60 * 2 * 1.5))
+        ind4 = PivotProfile(s, 60*60*2*n_scale, int(10 * hours_per_day * 60 * 60 * 2 * 1.5))
+        ind5 = PivotProfile(s, 120*60*2*n_scale, int(20 * hours_per_day * 60 * 60 * 2 * 1.5))
+        for ind in [
+                    ind1,
+                    ind2, 
+                    ind3, 
+                    ind4,
+                    ind5
+                    ]:
+            ind.precompute()
+            s.add_indicator(ind)
+        print 'Running', name
+        with Timer() as t:
+            s.run()
+        print 'Run took %f sec.' % t.interval
+    return s
+
+def test_merge_plot(year=2015, month_range=range(1, 13), exp_name0='', exp_name='', plot_name=''):
+    for exchange, commodity, tick_size, hours_per_day, n_scale in plot_futures:
+        name0 = base_dir+commodity+str(year%100)+str(month_range[0]).zfill(2)+'-'\
+            +str(year%100)+str(month_range[-1]).zfill(2)+'_pivot'+exp_name0
+        name = base_dir+commodity+str(year%100)+str(month_range[0]).zfill(2)+'-'\
+            +str(year%100)+str(month_range[-1]).zfill(2)+'_pivot'+exp_name+str(n_scale)
+#        print 'Loading', name+'.npz' 
+        d = load_dict(name+'.npz')
+        if 'piv_merged2' not in d:
+            with Timer() as t:
+                merge2(d, n_scale, ns_in_minutes)
+            print 'merge took %f sec.' % t.interval
+    #        return d
+            if commodity != 'ni':
+                d.update(load_dict(name0+'.npz'))
+            
+            with Timer() as t:
+                np.savez_compressed(name+'.npz', **d)
+            print 'Savez took %f sec.' % t.interval
+        
+        if commodity == 'ni':
+            d['piv_merged'] = d['piv_merged2']
+            d['piv30m.volatility'] = d['piv60m.volatility']
+            np.savez_compressed(name+'.npz', **d)
+                
+        with Timer() as t:
+            save_name = name + plot_name + '.png'
+            piecewise_plot(d, len(month_range), vec_inds=['piv_merged', 'piv_merged2', 'piv_merged3'], save_name=save_name)
+        print 'piecewise_plot took %f sec.' % t.interval
+        del d
+        gc.collect() 
+        
+def test_plot(year=2015, month_range=range(1, 13), exp_name='', plot_name=''):
+    for _, commodity, _, _ in plot_futures:
+        name = base_dir+commodity+str(year%100)+str(month_range[0]).zfill(2)+'-'+str(year%100)+str(month_range[-1]).zfill(2)+'_pivot'+exp_name
+        d = load_dict(name+'.npz')
+        with Timer() as t:
+            merge(d)
+        print 'merge took %f sec.' % t.interval
+        
+        with Timer() as t:
+            np.savez_compressed(name+'.npz', **d)
+        print 'Savez took %f sec.' % t.interval
+        
+        with Timer() as t:
+            save_name = name + plot_name + '.png'
+            piecewise_plot(d, len(month_range), vec_inds=['piv_merged'], inds=['pos'], save_name=save_name)
+        print 'piecewise_plot took %f sec.' % t.interval
+        del d
+                
+if __name__ == '__main__':
+    year = 2016
+    month_range = range(1, 6)
+#    test_output(year=year, month_range=month_range, exp_name='_nscale')
+    test_merge_plot(year=year, month_range=month_range, exp_name='_nscale', plot_name='')
+    

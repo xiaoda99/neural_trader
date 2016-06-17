@@ -6,6 +6,7 @@ import pylab as plt
 from profilehooks import profile
 import matplotlib.gridspec as gridspec
 
+from utils import *
 try:
     from collections import OrderedDict
 except:
@@ -254,10 +255,29 @@ class DeltaPattern():
         for i in range(self.m):
             rval[self.name + '[' + str(i) + ']'] = dxes[i]
         return rval
+         
+class MA(object):
+    def __init__(self, s, m, input_key='last_price', name=None):
+        self.__dict__.update(locals())
+        del self.self
         
-class MACD(Indicator):
-    def __init__(self, s, n, m, input_key='last_price',
-                 name=None, escape_opening=1, standardized=False, filter_thld=np.inf
+        if self.name is None:
+            self.name = 'ma' + str(int(m / 120)) + 'm'
+        
+        self.x = self.s.history[self.input_key]
+        self.EMA = EMA(m)
+        
+    def step(self):
+        self.ema = self.EMA.step(self.x[self.s.now - 1])
+            
+    def output(self):
+        rval = OrderedDict()
+        rval[self.name] = self.ema
+        return rval
+        
+class MACD(object):
+    def __init__(self, s, n, m, mdev_m=None, input_key='last_price',
+                 name=None, escape_opening=0, standardized=True, filter_thld=np.inf
                  ):
         self.__dict__.update(locals())
         del self.self
@@ -276,8 +296,10 @@ class MACD(Indicator):
         self.slow_EMA = EMA(m)
         self.y = 0.
 #        super(MACD, self).__init__()
+        if self.mdev_m is None:
+            self.mdev_m = self.m * 100
         if self.standardized:
-            self.y_MDEV = MDEV(self.m*50, dev_type='standard', warmup_steps=self.m*5, filter_thld=self.filter_thld)
+            self.y_MDEV = MDEV(self.mdev_m, dev_type='standard', warmup_steps=self.mdev_m/10, filter_thld=self.filter_thld)
             
     def step(self):
         if self.s.history['time_in_ticks'][self.s.now - 1] < self.escape_opening:
@@ -288,7 +310,14 @@ class MACD(Indicator):
         self.y = self.fast_ema - self.slow_ema
 #        self.fast[self.s.now - 1], self.slow[self.s.now - 1], self.y[self.s.now - 1] = fast_ema, slow_ema, fast_ema - slow_ema
         
-#        self.postprocess()
+        if self.standardized:
+            y_stdev = self.y_MDEV.step(self.y)
+            if y_stdev is not None:
+                assert y_stdev != 0
+                y_std = self.y / y_stdev
+            else:
+                y_std = 0.
+            self.y = y_std
             
     def output(self):
         rval = OrderedDict()
@@ -371,6 +400,103 @@ class ExpectedChange(Indicator):
         rval[self.name] = self.y
         rval[self.name + '.orig'] = self.orig_y
         return rval
+   
+class PastXtrm():
+    def __init__(self, s, n, input_key='last_price', name=None, upto_day_open=False):
+        self.__dict__.update(locals())
+        del self.self
+        
+        if self.name is None:
+            self.name = 'past' + str(int(self.n / 120)) + 'm'
+        
+        self.x = self.s.history[self.input_key]
+           
+    def step(self):
+        return
+     
+    def output(self):
+        last = self.x[self.s.now - 1]
+        if self.s.now - self.n < 0:
+            high, low = last, last
+            high_step, low_step = self.s.now - 1, self.s.now - 1
+        else:
+            start = self.s.now - self.n
+            stop = self.s.now
+            if self.upto_day_open:
+                where_day_open = np.where(self.s.history['time_in_ticks'][start : stop] == 0 | 
+                                       (self.s.history['morning_open'][start : stop] == 1))[0]
+                if len(where_day_open) > 0:
+                    start = start + where_day_open[0]
+            
+            argmax = self.x[start : stop].argmax()
+            argmin = self.x[start : stop].argmin()
+            high = self.x[start : stop][argmax]
+            low = self.x[start : stop][argmin]
+            high_step = start + argmax
+            low_step = start + argmin
+        if high - low == 0:
+            rsv = 0.
+        else:
+            rsv = ((last - low) - (high - last)) / (high - low)
+        self.high, self.low, self.rsv = high, low, rsv
+        self.high_step, self.low_step = high_step, low_step
+        
+        rval = OrderedDict()
+        rval[self.name + '.low'] = self.low
+        rval[self.name + '.high'] = self.high
+        rval[self.name + '.low_step'] = self.low_step
+        rval[self.name + '.high_step'] = self.high_step
+        rval[self.name + '.rsv'] = self.rsv
+        return rval
+     
+class FutureXtrm():
+    def __init__(self, s, n, input_key='last_price', name=None, upto_day_close=False):
+        self.__dict__.update(locals())
+        del self.self
+        
+        if self.name is None:
+            self.name = 'in' + str(int(self.n / 120)) + 'm'
+        
+        self.x = self.s.history[self.input_key]
+           
+    def step(self):
+        return
+     
+    def output(self):
+        last = self.x[self.s.now - 1]
+        start = self.s.now
+        stop = min(self.s.now + self.n, self.x.shape[0])
+        if self.upto_day_close:
+            where_day_close = np.where((self.s.history['time_in_ticks'][start : stop] == 0) | 
+                                       (self.s.history['morning_open'][start : stop] == 1))[0]
+            if len(where_day_close) > 0:
+                stop = start + where_day_close[0]
+        if start == stop:
+            low, high, low_before_high, high_before_low = last, last, last, last
+            low_step, high_step, low_before_high_step, high_before_low_step = start, start, start, start
+        else:
+            argmax = self.x[start : stop].argmax()
+            argmin = self.x[start : stop].argmin()
+            high = self.x[start : stop][argmax]
+            low = self.x[start : stop][argmin]
+            high_step = start + argmax
+            low_step = start + argmin
+            argmin = self.x[start : high_step + 1].argmin()
+            argmax = self.x[start : low_step + 1].argmax()
+            low_before_high = self.x[start : high_step + 1][argmin]
+            high_before_low = self.x[start : low_step + 1][argmax]
+            low_before_high_step = start + argmin
+            high_before_low_step = start + argmax
+        self.low, self.high, self.low_before_high, self.high_before_low = low, high, low_before_high, high_before_low 
+        self.low_step, self.high_step, self.low_before_high_step, self.high_before_low_step = \
+            high_step, low_step, low_before_high_step, high_before_low_step
+            
+        rval = OrderedDict()
+        self.subnames = ['low', 'high', 'low_before_high', 'high_before_low', 
+                         'low_step', 'high_step', 'low_before_high_step', 'high_before_low_step']  
+        for name in self.subnames:
+            rval[self.name + '.' + name] = getattr(self, name)
+        return rval
     
 class TimeInfo():
     def __init__(self, s, input_key='time_in_ticks',
@@ -395,78 +521,6 @@ class TimeInfo():
         rval[self.name + 'day'] = self.day_idx
         rval[self.name + 'time'] = self.x[self.s.now - 1] #* 1. / self.ticks_per_day
         return rval
-               
-class ddMACD(Indicator):
-    def __init__(self, s, n, m,
-                 name=None, escape_opening=1, mvar_days=None, standardized=True
-                 ):
-        self.__dict__.update(locals())
-        del self.self
-        
-        self.buffer_len = self.s.buffer_len
-        if self.name is None:
-            self.name = 'ACC(' + str(int(n / 120)) + 'm)'
-        
-        self.x = self.s.history['last_price']
-        self.ddx = np.zeros(self.buffer_len)
-        self.fast = np.zeros(self.buffer_len)
-        self.slow = np.zeros(self.buffer_len)
-        self.y = np.zeros(self.buffer_len)
-        self.buffers = [self.ddx, self.fast, self.slow, self.y]
-            
-        self.fast_EMA = EMA(n)
-        self.slow_EMA = EMA(m)
-        self.dx_Delta = Delta()
-        
-    def step(self):
-        if self.s.history['time_in_ticks'][self.s.now - 1] < self.escape_opening:  # Avoid big jumps near opening. Notice that dMACD and MACD do not have this issue. 
-            self.fast_EMA.reset()
-            self.slow_EMA.reset()
-            self.dx_Delta.reset()
-            dx = 0
-        else:
-            dx = self.x[self.s.now - 1] - self.x[self.s.now - 2]
-        ddx = self.dx_Delta.step(dx)
-        ddx_fast_ema = self.fast_EMA.step(ddx)
-        ddx_slow_ema = self.slow_EMA.step(ddx)
-        self.ddx[self.s.now - 1] = ddx
-        self.y[self.s.now - 1] = ddx_fast_ema - ddx_slow_ema
-        if self.standardized:
-            self.standardize()
-             
-class ACC(Indicator):
-    def __init__(self, s, n,
-                 name=None, escape_opening=1, mvar_days=None, standardized=True
-                 ):
-        self.__dict__.update(locals())
-        del self.self
-        
-        self.buffer_len = self.s.buffer_len
-        if self.name is None:
-            self.name = 'ACC(' + str(int(n / 120)) + 'm)'
-        
-        self.x = self.s.history['last_price']
-        self.ddx = np.zeros(self.buffer_len)
-        self.y = np.zeros(self.buffer_len)
-        self.buffers = [self.ddx, self.y]
-        
-        self.ddx_EMA = EMA(n)
-        self.dx_Delta = Delta()
-        
-    def step(self):
-#        if self.s.market_just_opened():
-        if self.s.history['time_in_ticks'][self.s.now - 1] < self.escape_opening:  # Avoid big jumps near opening. Notice that dMACD and MACD do not have this issue. 
-            self.ddx_EMA.reset()
-            self.dx_Delta.reset()
-            dx = 0
-        else:
-            dx = self.x[self.s.now - 1] - self.x[self.s.now - 2]
-        ddx = self.dx_Delta.step(dx)
-        acc = self.ddx_EMA.step(ddx)
-        self.ddx[self.s.now - 1] = ddx
-        self.y[self.s.now - 1] = acc
-        if self.standardized:
-            self.standardize()
     
 from build_tick_dataset import load_ticks
 from strategy import Strategy
@@ -487,27 +541,54 @@ def test_macd():
         s.add_indicator(ind)
     
     s.run()
-    
-def test_all():
-    ticks = load_ticks('dc', 'pp', 2015, range(6,10), use_cache=True)
-    s = Strategy('pp1506-1509_common_stride10', ticks, 3.75)
-    
-    inds = [
-            MACD(s, 1*60*2, 5*60*2, escape_opening=1),
-            MACD(s, 2*60*2, 10*60*2, escape_opening=1),
-            MACD(s, 10*60*2, 60*60*2, escape_opening=0),
-            dMACD(s, 1*60*2, 5*60*2, 2.5*60*2, standardized=True, escape_opening=1),
-            dMACD(s, 2*60*2, 10*60*2, 2.5*60*2, standardized=True, escape_opening=1),
-            dMACD(s, 10*60*2, 60*60*2, 30*60*2, standardized=True, escape_opening=0, filter_thld=3.),
-            ExpectedChange(s, 5*60*2, standardized=True, escape_opening=3*60*2),
-            ExpectedChange(s, 10*60*2, standardized=True, escape_opening=3*60*2),
+
+from build_tick_dataset import futures   
+base_dir = 'data/'
+
+def test_output(year=2016, month_range=range(1, 6), exp_name=''):
+    for exchange, commodity, tick_size, hours_per_day in futures:
+        ticks = load_ticks(exchange, commodity, year, month_range)   
+        name = base_dir+commodity+str(year%100)+str(month_range[0]).zfill(2)+'-'+str(year%100)+str(month_range[-1]).zfill(2)+'_common'+exp_name
+        s = Strategy(name, ticks, tick_size, hours_per_day, save_freq=10)#, show_freq=10)
+        inds = [
+#            MACD(s, 10, 1*60*2, escape_opening=0),
+#            MACD(s, 10, 5*60*2, escape_opening=0),
+#            MACD(s, 1*60*2, 10*60*2, escape_opening=0),
+#            MACD(s, 5*60*2, 30*60*2, escape_opening=0),
+#            MACD(s, 5*60*2, 60*60*2, escape_opening=0),
+#            MACD(s, 5*60*2, 120*60*2, escape_opening=0),
+#            MACD(s, 5*60*2, 240*60*2, escape_opening=0),
+#            MA(s, 5*2),
+#            MA(s, 1*60*2),
+#            MA(s, 5*60*2),
+#            MA(s, 10*60*2),
+#            MA(s, 30*60*2),
+#            MA(s, 60*60*2),
+#            MA(s, 120*60*2),
+#            MA(s, 240*60*2),
+            PastXtrm(s, 5*60*2),
+            PastXtrm(s, 10*60*2),
+            PastXtrm(s, 30*60*2),
+            PastXtrm(s, 60*60*2),
+            PastXtrm(s, 120*60*2),
+            PastXtrm(s, 240*60*2),
+            FutureXtrm(s, 5*60*2),
+            FutureXtrm(s, 10*60*2),
+            FutureXtrm(s, 30*60*2),
+            FutureXtrm(s, 60*60*2),
+            FutureXtrm(s, 120*60*2),
+            FutureXtrm(s, 240*60*2),
             TimeInfo(s)
             ]
-    
-    for ind in inds:
-        s.add_indicator(ind)
-    
-    s.run()
+        for ind in inds:
+            s.add_indicator(ind)
+        print 'Running', name
+        with Timer() as t:
+            s.run()
+        print 'Run took %f sec.' % t.interval
+    return s
   
 if __name__ == '__main__':
-    test_all()
+    year = 2016
+    month_range = range(1, 6)
+    test_output(year=year, month_range=month_range, exp_name='_xtrm_upto0')
